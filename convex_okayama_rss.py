@@ -19,7 +19,7 @@ headers = {
 }
 
 # --------------------------------------------------
-# 以前のRSSに存在するイベントとpubDateを読み込む
+# 既存RSSの情報を読み込む
 # --------------------------------------------------
 
 old_items = {}
@@ -43,10 +43,12 @@ if os.path.exists(OUTPUT_FILE):
 print("既存RSS件数:", len(old_items))
 
 # --------------------------------------------------
-# イベント一覧を全ページ取得
+# 一覧ページから現在掲載されているイベントURLを取得
 # --------------------------------------------------
 
-events = {}
+event_urls = []
+seen_urls = set()
+
 page = 1
 
 while True:
@@ -71,51 +73,21 @@ while True:
     for a in soup.find_all("a", href=True):
         href = urljoin(BASE_URL, a["href"])
 
-        # /event/数字/ の個別イベントだけ
         if not re.fullmatch(
             r"https://www\.convex-okayama\.co\.jp/event/\d+/",
             href
         ):
             continue
 
-        text = " ".join(a.stripped_strings).strip()
-
-        if not text:
+        if href in seen_urls:
             continue
 
-        # 「期間：...」の後ろからタイトル部分を取り出す
-        text = re.sub(r"^期間：\S+(?:〜\S+)?\s*", "", text)
-
-        # 会場名などより前をタイトル候補にする
-        separators = [
-            " 大展示場",
-            " 中展示場",
-            " 小展示場",
-            " 屋外展示場",
-        ]
-
-        title = text
-
-        positions = [
-            title.find(s)
-            for s in separators
-            if title.find(s) != -1
-        ]
-
-        if positions:
-            title = title[:min(positions)]
-
-        title = title.strip()
-
-        if not title:
-            continue
-
-        events[href] = title
+        seen_urls.add(href)
+        event_urls.append(href)
         found += 1
 
-    print(f"PAGE {page} イベント:", found)
+    print(f"PAGE {page} イベントURL:", found)
 
-    # 次ページが存在するか確認
     next_url = f"{LIST_URL}page/{page + 1}/"
 
     has_next = any(
@@ -129,7 +101,55 @@ while True:
     page += 1
 
 print()
-print("現在のイベント総数:", len(events))
+print("現在のイベント総数:", len(event_urls))
+
+# --------------------------------------------------
+# 個別ページから正式タイトルを取得
+# --------------------------------------------------
+
+events = []
+
+for i, link in enumerate(event_urls, 1):
+    r = requests.get(link, headers=headers, timeout=30)
+
+    print(f"DETAIL {i}/{len(event_urls)} HTTP:", r.status_code, link)
+
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    title = ""
+
+    # まずOGタイトルを使用
+    og = soup.find("meta", property="og:title")
+
+    if og and og.get("content"):
+        title = og["content"].strip()
+
+    # サイト名などの後置部分を除去
+    title = re.sub(
+        r"\s*[|｜]\s*コンベックス岡山.*$",
+        "",
+        title
+    ).strip()
+
+    # OGタイトルが取れない場合の予備
+    if not title:
+        h1 = soup.find("h1")
+        if h1:
+            title = " ".join(h1.stripped_strings).strip()
+
+    if not title:
+        print("タイトル取得失敗:", link)
+        continue
+
+    events.append({
+        "title": title,
+        "link": link
+    })
+
+print()
+print("タイトル取得成功:", len(events))
 
 # --------------------------------------------------
 # RSS作成
@@ -147,7 +167,9 @@ SubElement(channel, "language").text = "ja"
 
 rss_items = []
 
-for link, title in events.items():
+for event in events:
+    link = event["link"]
+    title = event["title"]
 
     if link in old_items and old_items[link]:
         pub_date = old_items[link]
@@ -160,16 +182,15 @@ for link, title in events.items():
         "title": title,
         "link": link,
         "pubDate": pub_date,
-        "new": is_new,
+        "new": is_new
     })
 
-# 新規イベントを先頭へ
+# 新規掲載されたイベントを先頭へ
 rss_items.sort(
     key=lambda x: (not x["new"], x["link"])
 )
 
 for i, data in enumerate(rss_items, 1):
-
     item = SubElement(channel, "item")
 
     SubElement(item, "title").text = data["title"]
