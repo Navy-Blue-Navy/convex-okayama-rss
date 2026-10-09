@@ -18,6 +18,30 @@ headers = {
     "User-Agent": "Mozilla/5.0"
 }
 
+
+# --------------------------------------------------
+# ページ取得
+# 通信エラーの場合はNoneを返す
+# --------------------------------------------------
+
+def get_page(url):
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            timeout=30
+        )
+
+        r.raise_for_status()
+
+        return r
+
+    except requests.RequestException as e:
+        print("取得失敗:", url)
+        print("理由:", e)
+        return None
+
+
 # --------------------------------------------------
 # 既存RSSの情報を読み込む
 # --------------------------------------------------
@@ -42,6 +66,7 @@ if os.path.exists(OUTPUT_FILE):
 
 print("既存RSS件数:", len(old_items))
 
+
 # --------------------------------------------------
 # 一覧ページから現在掲載されているイベントURLを取得
 # --------------------------------------------------
@@ -52,27 +77,31 @@ seen_urls = set()
 page = 1
 
 while True:
+
     if page == 1:
         url = LIST_URL
     else:
         url = f"{LIST_URL}page/{page}/"
 
-    r = requests.get(url, headers=headers, timeout=30)
+    r = get_page(url)
+
+    if r is None:
+        print()
+        print("一覧ページを取得できなかったため、今回は更新しません。")
+        print("既存RSSをそのまま維持します。")
+        raise SystemExit(0)
 
     print(f"PAGE {page} HTTP:", r.status_code)
-
-    if r.status_code == 404:
-        break
-
-    r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
 
     found = 0
 
     for a in soup.find_all("a", href=True):
+
         href = urljoin(BASE_URL, a["href"])
 
+        # /event/数字/ の個別イベントだけ取得
         if not re.fullmatch(
             r"https://www\.convex-okayama\.co\.jp/event/\d+/",
             href
@@ -100,8 +129,23 @@ while True:
 
     page += 1
 
+
 print()
 print("現在のイベント総数:", len(event_urls))
+
+
+# --------------------------------------------------
+# 安全確認
+# 0件の場合はXMLを書き換えない
+# --------------------------------------------------
+
+if len(event_urls) == 0:
+    print()
+    print("イベントを1件も取得できませんでした。")
+    print("サイト構造変更の可能性があるため、今回は更新しません。")
+    print("既存RSSをそのまま維持します。")
+    raise SystemExit(0)
+
 
 # --------------------------------------------------
 # 個別ページから正式タイトルを取得
@@ -110,17 +154,29 @@ print("現在のイベント総数:", len(event_urls))
 events = []
 
 for i, link in enumerate(event_urls, 1):
-    r = requests.get(link, headers=headers, timeout=30)
 
-    print(f"DETAIL {i}/{len(event_urls)} HTTP:", r.status_code, link)
+    r = get_page(link)
 
-    r.raise_for_status()
+    if r is None:
+        print()
+        print(
+            f"DETAIL {i}/{len(event_urls)} "
+            f"取得失敗: {link}"
+        )
+        print("一部取得に失敗したため、今回は更新しません。")
+        print("既存RSSをそのまま維持します。")
+        raise SystemExit(0)
+
+    print(
+        f"DETAIL {i}/{len(event_urls)} "
+        f"HTTP: {r.status_code} {link}"
+    )
 
     soup = BeautifulSoup(r.text, "html.parser")
 
     title = ""
 
-    # まずOGタイトルを使用
+    # OGタイトルを優先
     og = soup.find("meta", property="og:title")
 
     if og and og.get("content"):
@@ -133,23 +189,44 @@ for i, link in enumerate(event_urls, 1):
         title
     ).strip()
 
-    # OGタイトルが取れない場合の予備
+    # OGタイトルが取得できない場合はh1を使用
     if not title:
         h1 = soup.find("h1")
-        if h1:
-            title = " ".join(h1.stripped_strings).strip()
 
+        if h1:
+            title = " ".join(
+                h1.stripped_strings
+            ).strip()
+
+    # タイトルが取得できなければ更新を中止
     if not title:
+        print()
         print("タイトル取得失敗:", link)
-        continue
+        print("今回は更新しません。")
+        print("既存RSSをそのまま維持します。")
+        raise SystemExit(0)
 
     events.append({
         "title": title,
         "link": link
     })
 
+
 print()
 print("タイトル取得成功:", len(events))
+
+
+# --------------------------------------------------
+# 全件取得できたか確認
+# --------------------------------------------------
+
+if len(events) != len(event_urls):
+    print()
+    print("イベントURL数とタイトル取得数が一致しません。")
+    print("今回は更新しません。")
+    print("既存RSSをそのまま維持します。")
+    raise SystemExit(0)
+
 
 # --------------------------------------------------
 # RSS作成
@@ -160,20 +237,40 @@ now = datetime.now(JST)
 rss = Element("rss", version="2.0")
 channel = SubElement(rss, "channel")
 
-SubElement(channel, "title").text = "コンベックス岡山 イベント情報"
-SubElement(channel, "link").text = LIST_URL
-SubElement(channel, "description").text = "コンベックス岡山のイベント情報"
-SubElement(channel, "language").text = "ja"
+SubElement(
+    channel,
+    "title"
+).text = "コンベックス岡山 イベント情報"
+
+SubElement(
+    channel,
+    "link"
+).text = LIST_URL
+
+SubElement(
+    channel,
+    "description"
+).text = "コンベックス岡山のイベント情報"
+
+SubElement(
+    channel,
+    "language"
+).text = "ja"
+
 
 rss_items = []
 
 for event in events:
+
     link = event["link"]
     title = event["title"]
 
+    # 既存イベントは以前のpubDateを維持
     if link in old_items and old_items[link]:
         pub_date = old_items[link]
         is_new = False
+
+    # 新しく発見したイベントは現在時刻をpubDateにする
     else:
         pub_date = format_datetime(now)
         is_new = True
@@ -185,23 +282,51 @@ for event in events:
         "new": is_new
     })
 
-# 新規掲載されたイベントを先頭へ
+
+# --------------------------------------------------
+# 新規イベントを先頭へ
+# --------------------------------------------------
+
 rss_items.sort(
-    key=lambda x: (not x["new"], x["link"])
+    key=lambda x: (
+        not x["new"],
+        x["link"]
+    )
 )
 
+
+# --------------------------------------------------
+# RSS item作成
+# --------------------------------------------------
+
 for i, data in enumerate(rss_items, 1):
+
     item = SubElement(channel, "item")
 
-    SubElement(item, "title").text = data["title"]
-    SubElement(item, "link").text = data["link"]
+    SubElement(
+        item,
+        "title"
+    ).text = data["title"]
 
-    guid = SubElement(item, "guid", isPermaLink="false")
+    SubElement(
+        item,
+        "link"
+    ).text = data["link"]
+
+    guid = SubElement(
+        item,
+        "guid",
+        isPermaLink="false"
+    )
+
     guid.text = hashlib.sha256(
         data["link"].encode("utf-8")
     ).hexdigest()
 
-    SubElement(item, "pubDate").text = data["pubDate"]
+    SubElement(
+        item,
+        "pubDate"
+    ).text = data["pubDate"]
 
     status = "NEW" if data["new"] else "OLD"
 
@@ -210,6 +335,12 @@ for i, data in enumerate(rss_items, 1):
         f"{data['title']} "
         f"{data['link']}"
     )
+
+
+# --------------------------------------------------
+# XML保存
+# ここまで全部正常だった場合だけ書き換える
+# --------------------------------------------------
 
 tree = ElementTree(rss)
 
@@ -221,3 +352,4 @@ tree.write(
 
 print()
 print("保存:", OUTPUT_FILE)
+print("RSS更新完了")
